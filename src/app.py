@@ -1,124 +1,147 @@
+import os
+import psycopg2
 import streamlit as st
-import fitz  # PyMuPDF
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-import google.generativeai as genai
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from pgvector.psycopg2 import register_vector
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores.pgvector import PGVector
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.document_loaders import PyMuPDFLoader
+from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, AIMessage
-import os,re
 
-# Load API Key from .env
+# Load environment variables
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Streamlit UI
-st.title("Therapist Chatbot")
+# Streamlit UI Config
+st.set_page_config(page_title="Therapist Chatbot", page_icon="🧠")
+st.title("🧠 Therapist Chatbot")
 
-# 1️⃣ Load Local PDF File
-PDF_PATHS = ["C:\\Users\\vc\\Desktop\\Projects\\Chat Bot using pdf\\stages of counselling.pdf",
-            "C:\\Users\\vc\\Desktop\\Projects\\Chat Bot using pdf\\Chapter1IntroductiontoSpeechandLanguageTherapy.pdf",
-            "C:\\Users\\vc\\Desktop\\Projects\\Chat Bot using pdf\\chapter16.pdf",
-]
-
-def extract_text_from_pdfs(file_paths):
-    all_text = ""
-    for pdf_path in file_paths:
-        if os.path.exists(pdf_path):  # Ensure file exists
-            doc = fitz.open(pdf_path)
-            text = "\n".join([page.get_text("text") for page in doc])
-            all_text += f"\n\n### {os.path.basename(pdf_path)} ###\n{text}"  # Store text with filename for context
-        else:
-            st.warning(f"File not found: {pdf_path}")  # Warn if file doesn't exist
-    return all_text
-
+# Initialize database session
 if "db" not in st.session_state:
     st.session_state.db = None
 
-if st.session_state.db == None:
-    with st.spinner("Loading..."):
-        doc =  extract_text_from_pdfs(PDF_PATHS)
+# Function to get database connection
+def get_db_connection():
+    conn = psycopg2.connect(DATABASE_URL)
+    register_vector(conn)
+    return conn
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        chunks = text_splitter.split_text(doc)
-
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=GEMINI_API_KEY)
-        st.session_state.db = FAISS.from_texts(chunks, embeddings)
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-for message in st.session_state.chat_history:
-    if isinstance(message, HumanMessage):
-        with st.chat_message("Human"):
-            st.markdown(message.content)
-    else:
-        with st.chat_message("AI"):
-            st.markdown(message.content)
-
-    
-def get_response(query, chat_history):
-    retriever = st.session_state.db.as_retriever()
-    docs = retriever.get_relevant_documents(query)
-
-    if docs:
-        #Use relevant context from the PDF
-        context = "\n\n".join([d.page_content for d in docs[:3]])
-        prompt_text = (
-            "You are a personal therapist. Answer the following questions considering the"
-            "Previous conversation:\n{chat_history}\n\n"
-            "Answer based on this context:\n{context}\n\n"
-            "Question: {user_question}"
+# Function to store chat history in PostgreSQL
+def store_chat_history(user_id, user_query, ai_response):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(""" 
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT,
+            user_query TEXT,
+            ai_response TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    else:
-        # No relevant data → Answer directly using LLM
-        context = "No relevant information from the document."
-        prompt_text = (
-            "You are a personal therapist. Answer the following questions considering the"
-            "Previous conversation:\n{chat_history}\n\n"
-            "The document has no relevant information. Answer based on general knowledge.\n\n"
-            "Question: {user_question}"
-        )
-
-    # Define Prompt Template
-    prompt = PromptTemplate(
-        input_variables=["chat_history", "context", "user_question"],
-        template=prompt_text
+    """)
+    cursor.execute(
+        "INSERT INTO chat_history (user_id, user_query, ai_response) VALUES (%s, %s, %s)",
+        (user_id, user_query, ai_response)
     )
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-    # LLM Chain with Gemini
+# Function to retrieve full chat history from PostgreSQL
+def get_chat_history(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_query, ai_response FROM chat_history WHERE user_id = %s ORDER BY timestamp ASC",
+        (user_id,)
+    )
+    history = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return history
+
+# Function to generate response from LLM
+def get_response(query, user_id):
+    chat_history = get_chat_history(user_id)  # Fetch entire conversation history
+    chat_history_str = "\n".join([f"User: {h[0]}\nBot: {h[1]}" for h in chat_history])
+
+    retriever = st.session_state.db.as_retriever() if st.session_state.db else None
+    docs = retriever.get_relevant_documents(query) if retriever else []
+    context = "\n\n".join([d.page_content for d in docs[:3]]) if docs else ""
+
+    # Prompt template
+    prompt_text = (
+        "You are a personal therapist. Provide therapy-related support and guidance. "
+        "Keep responses warm, empathetic, and focused on mental health.\n\n"
+        "Past conversation:\n{chat_history}\n\n"
+        "Context:\n{context}\n\n"
+        "User's question: {user_question}"
+    )
+    prompt = PromptTemplate(input_variables=["chat_history", "context", "user_question"], template=prompt_text)
+    
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-8b", google_api_key=GEMINI_API_KEY)
     chain = prompt | llm | StrOutputParser()
-
-    # Stream response in chunks
+    
     response_generator = chain.stream({
-        "chat_history": chat_history,
+        "chat_history": chat_history_str,
         "context": context,
         "user_question": query,
     })
+    
+    return response_generator or iter([])
 
-    if response_generator is None:
-        return iter([])
-    return response_generator  # Return generator for streaming
+# Function to process uploaded PDF file
+def process_pdf(file):
+    save_path = os.path.join("temp", file.name)
+    os.makedirs("temp", exist_ok=True)
 
+    with open(save_path, "wb") as f:
+        f.write(file.getbuffer())
 
-# 5️⃣ Chat Input
-query = st.chat_input("Ask something about Therapy...")
+    pdf_loader = PyMuPDFLoader(save_path)
+    docs = pdf_loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    chunks = text_splitter.split_documents(docs)
 
+    # Store in PostgreSQL using pgvector
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
+    connection = get_db_connection()
+    st.session_state.db = PGVector.from_documents(chunks, embeddings, connection_string=DATABASE_URL, collection_name="therapy_chatbot_embeddings")
+
+    st.success("PDF processed and stored in vector database!")
+
+# Sidebar for uploading PDF file
+st.sidebar.header("Upload Therapist Guide (PDF)")
+uploaded_file = st.sidebar.file_uploader("Upload a PDF", type=["pdf"])
+if uploaded_file:
+    process_pdf(uploaded_file)
+
+# Chat Interface
+user_id = "default_user"  # Replace with actual user authentication if available
+chat_history = get_chat_history(user_id)
+
+# Display past chat history within the chat interface
+for user_msg, bot_msg in chat_history:  # Show full conversation in order
+    with st.chat_message("Human"):
+        st.markdown(user_msg)
+    with st.chat_message("AI"):
+        cleaned_bot_msg = bot_msg.replace("Bot:", "").strip()
+        st.markdown(cleaned_bot_msg)
+
+# Chat input
+query = st.chat_input("Ask a therapy-related question...")
 if query:
-    st.session_state.chat_history.append(HumanMessage(query))
     with st.chat_message("Human"):
         st.markdown(query)
 
     with st.chat_message("AI"):
-        ai_response = st.write_stream(get_response(query, st.session_state.chat_history))
+        ai_response = get_response(query, user_id)  # Generator
 
-    if isinstance(ai_response, dict):
-        content = ai_response.get("content", "")
-    elif isinstance(ai_response, str):
-        content = ai_response  # If it's already a string, just use it.
+        # Stream the response in real-time
+        response_content = st.write_stream(ai_response)
 
-    st.session_state.chat_history.append(AIMessage(content))
+    store_chat_history(user_id, query, response_content)
